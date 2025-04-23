@@ -1,159 +1,224 @@
 #!/home/linuxbrew/.linuxbrew/bin/python3
 
-import re
-import json
-import argparse
+import os
 import subprocess
+import json
+import sys
+import re
 from collections import defaultdict
-import xml.etree.ElementTree as ET
+from datetime import datetime
 
-# CLI args
-parser = argparse.ArgumentParser(description="Show bridge domains like JunOS")
-parser.add_argument('--list', action='store_true', help="List all bridge domains only")
-parser.add_argument('--bridge', type=str, help="Show details for a specific bridge only")
-parser.add_argument('--json', action='store_true', help="Print output as JSON")
-parser.add_argument('--xml', action='store_true', help="Print output as XML")
-args = parser.parse_args()
 
-# Step 1: Collect IP address info
-iface_info = {}
-ip_addr_output = subprocess.check_output(["ip", "-brief", "address"]).decode()
+def get_ip_info():
+    iface_info = {}
+    ip_addr_output = subprocess.check_output(["ip", "-brief", "address"]).decode()
+    for line in ip_addr_output.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        iface, state, *rest = parts
+        ip = next((r for r in rest if re.match(r"\d+\.\d+\.\d+\.\d+/", r)), "-")
+        iface_info[iface] = {"ip": ip, "admin": state, "link": "-"}
+    return iface_info
 
-for line in ip_addr_output.strip().splitlines():
-    parts = line.split()
-    if len(parts) < 3:
-        continue
-    iface, state, *rest = parts
-    ip = next((r for r in rest if re.match(r"\d+\.\d+\.\d+\.\d+/", r)), "-")
-    iface_info[iface] = {"ip": ip}
 
-# Step 2: Collect MAC and MTU info
-ip_link_output = subprocess.check_output(["ip", "-details", "link"]).decode()
-current_iface = None
+def get_linux_interfaces():
+    iface_info = get_ip_info()
+    ip_link_output = subprocess.check_output(["ip", "-details", "link"]).decode()
+    current_iface = None
 
-for line in ip_link_output.strip().splitlines():
-    if re.match(r'^\d+:\s+\S+:', line):
-        m = re.match(r'^\d+:\s+(\S+):.*mtu\s+(\d+).*', line)
-        if m:
-            iface_full, mtu = m.groups()
+    for line in ip_link_output.strip().splitlines():
+        if re.match(r'^\d+:\s+\S+:', line):
+            m = re.match(r'^\d+:\s+(\S+):\s+<([^>]*)>.*mtu\s+(\d+).*', line)
+            if m:
+                iface_full, flags, mtu = m.groups()
+                iface = iface_full.split('@')[0]
+                current_iface = iface
+                if iface not in iface_info:
+                    iface_info[iface] = {"ip": "-", "admin": "-", "link": "-"}
+                iface_info[iface]["mtu"] = mtu
+                iface_info[iface]["link"] = "up" if "LOWER_UP" in flags else "down"
+        elif 'link/' in line and current_iface:
+            m = re.search(r'link/\S+\s+([0-9a-f:]{17})', line)
+            if m:
+                iface_info[current_iface]["mac"] = m.group(1)
+
+    return iface_info
+
+
+def get_linux_bridges():
+    iface_info = get_ip_info()
+    ip_link_output = subprocess.check_output(["ip", "-details", "link"]).decode()
+    current_iface = None
+
+    for line in ip_link_output.strip().splitlines():
+        if re.match(r'^\d+:\s+\S+:', line):
+            m = re.match(r'^\d+:\s+(\S+):.*mtu\s+(\d+).*', line)
+            if m:
+                iface_full, mtu = m.groups()
+                iface = iface_full.split('@')[0]
+                current_iface = iface
+                if iface not in iface_info:
+                    iface_info[iface] = {}
+                iface_info[iface]["mtu"] = mtu
+        elif 'link/' in line and current_iface:
+            m = re.search(r'link/\S+\s+([0-9a-f:]{17})', line)
+            if m:
+                iface_info[current_iface]["mac"] = m.group(1)
+
+    bridge_output = subprocess.check_output(["bridge", "link"]).decode()
+    bridge_re = re.compile(
+        r"^\d+:\s+(\S+):\s+<([^>]*)>\s+mtu\s+(\d+)\s+master\s+(\S+)\s+state\s+(\S+)\s+priority\s+(\d+)\s+cost\s+(\d+)"
+    )
+
+    bridges = defaultdict(lambda: {"type": "linux", "interfaces": [], "mac_table": []})
+
+    for line in bridge_output.strip().splitlines():
+        match = bridge_re.match(line)
+        if match:
+            iface_full, flags, mtu, bridge, state, prio, cost = match.groups()
             iface = iface_full.split('@')[0]
-            current_iface = iface
-            if iface not in iface_info:
-                iface_info[iface] = {}
-            iface_info[iface]["mtu"] = mtu
-    elif 'link/' in line and current_iface:
-        m = re.search(r'link/\S+\s+([0-9a-f:]{17})', line)
-        if m:
-            iface_info[current_iface]["mac"] = m.group(1)
+            info = iface_info.get(iface, {})
+            bridges[bridge]["interfaces"].append({
+                "name": iface_full,
+                "state": "Up" if "UP" in flags else "Down",
+                "mtu": info.get("mtu", "-"),
+                "mac": info.get("mac", "-"),
+                "ip": info.get("ip", "-"),
+                "learning": "Enabled"
+            })
 
-# Step 3: Parse bridge link output and build JSON structure
-bridge_output = subprocess.check_output(["bridge", "link"]).decode()
-bridge_re = re.compile(
-    r"^\d+:\s+(\S+):\s+<([^>]*)>\s+mtu\s+(\d+)\s+master\s+(\S+)\s+state\s+(\S+)\s+priority\s+(\d+)\s+cost\s+(\d+)"
-)
+    for bridge in bridges:
+        bridge_ifaces = {i["name"].split("@")[0] for i in bridges[bridge]["interfaces"]}
+        try:
+            fdb_output = subprocess.check_output(["bridge", "fdb", "show", "br", bridge]).decode()
+            shown = set()
+            for line in fdb_output.strip().splitlines():
+                match = re.match(r"^([0-9a-f:]{17})\s+dev\s+(\S+)", line)
+                if match:
+                    mac, dev = match.groups()
+                    if dev not in bridge_ifaces or " self " in line:
+                        continue
+                    key = (mac, dev)
+                    if key not in shown:
+                        bridges[bridge]["mac_table"].append({
+                            "mac": mac,
+                            "interface": dev
+                        })
+                        shown.add(key)
+        except subprocess.CalledProcessError:
+            continue
 
-bridges = defaultdict(lambda: {"interfaces": [], "mac_table": []})
+    return bridges
 
-for line in bridge_output.strip().splitlines():
-    match = bridge_re.match(line)
-    if match:
-        iface_full, flags, mtu, bridge, state, prio, cost = match.groups()
-        iface = iface_full.split('@')[0]
-        info = iface_info.get(iface, {})
-        bridges[bridge]["interfaces"].append({
-            "name": iface_full,
-            "state": "Up" if "UP" in flags else "Down",
-            "mtu": info.get("mtu", "-"),
-            "mac": info.get("mac", "-"),
-            "ip": info.get("ip", "-"),
-            "learning": "Enabled"
-        })
 
-# Step 4: Add MAC tables (filtered)
-for bridge in bridges:
-    bridge_ifaces = {i["name"].split("@")[0] for i in bridges[bridge]["interfaces"]}
-    try:
-        fdb_output = subprocess.check_output(["bridge", "fdb", "show", "br", bridge]).decode()
-        shown = set()
-        for line in fdb_output.strip().splitlines():
-            match = re.match(r"^([0-9a-f:]{17})\s+dev\s+(\S+)", line)
-            if match:
-                mac, dev = match.groups()
-                if dev not in bridge_ifaces or " self " in line:
-                    continue
-                key = (mac, dev)
-                if key not in shown:
-                    bridges[bridge]["mac_table"].append({
-                        "mac": mac,
-                        "interface": dev
-                    })
-                    shown.add(key)
-    except subprocess.CalledProcessError:
-        continue
+def print_interface_summary(interfaces, iface_filter=None):
+    print(f"{'Interface':<20}{'Admin':<8}{'Link':<8}{'Proto':<8}{'Local'}")
+    for name in sorted(interfaces):
+        if iface_filter and name != iface_filter:
+            continue
+        data = interfaces[name]
+        print(f"{name:<20}{data.get('admin', '-'):<8}{data.get('link', '-'):<8}{'inet':<8}{data.get('ip', '-')}")
 
-# Step 5: --list
-if args.list:
-    for br in sorted(bridges.keys()):
-        print(br)
-    exit(0)
 
-# Step 6: JSON output
-if args.json:
-    if args.bridge:
-        if args.bridge in bridges:
-            print(json.dumps({args.bridge: bridges[args.bridge]}, indent=2))
-        else:
-            print(json.dumps({"error": f"Bridge '{args.bridge}' not found"}, indent=2))
-    else:
-        print(json.dumps(bridges, indent=2))
-    exit(0)
+def print_interface_detail(interfaces, iface_filter):
+    if iface_filter not in interfaces:
+        print(f"Interface '{iface_filter}' not found.")
+        return
 
-# Step 7: XML output
-def dict_to_xml(data):
-    root = ET.Element("bridges")
-    for name, content in data.items():
-        bridge_elem = ET.SubElement(root, "bridge", name=name)
-        ifaces_elem = ET.SubElement(bridge_elem, "interfaces")
-        for intf in content["interfaces"]:
-            iface_elem = ET.SubElement(ifaces_elem, "interface", name=intf["name"])
-            for key in ("state", "mtu", "mac", "ip", "learning"):
-                ET.SubElement(iface_elem, key).text = str(intf[key])
-        fdb_elem = ET.SubElement(bridge_elem, "mac_table")
-        for entry in content["mac_table"]:
-            entry_elem = ET.SubElement(fdb_elem, "mac")
-            ET.SubElement(entry_elem, "address").text = entry["mac"]
-            ET.SubElement(entry_elem, "interface").text = entry["interface"]
-    return ET.tostring(root, encoding="unicode")
+    data = interfaces[iface_filter]
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"Physical interface: {iface_filter}, Enabled, Physical link is {data.get('link', '-')}")
+    print(f"  MTU: {data.get('mtu', '-')}, Link-level type: Ethernet")
+    print(f"  MAC address: {data.get('mac', '-')}  IP address: {data.get('ip', '-')}")
+    print(f"  Statistics last updated: {now}")
+    print("  Traffic statistics: (stubbed values)")
+    print("    Input  bytes  : 0")
+    print("    Output bytes  : 0")
+    print("    Input  packets: 0")
+    print("    Output packets: 0")
+    print("  Input errors: 0, Output errors: 0")
 
-if args.xml:
-    if args.bridge:
-        if args.bridge in bridges:
-            print(dict_to_xml({args.bridge: bridges[args.bridge]}))
-        else:
-            print(dict_to_xml({"error": {"message": f"Bridge '{args.bridge}' not found"}}))
-    else:
-        print(dict_to_xml(bridges))
-    exit(0)
 
-# Step 8: Human-readable output
-def show_bridge(bridge, data):
-    print(f"\nBridge domain: {bridge}")
-    print(f"  VLAN ID: -     Interfaces: {len(data['interfaces'])}")
-    print(f"    {'Interface':<18}{'State':<8}{'MTU':<6}{'MAC Address':<20}{'IP Address':<18}{'MAC learning'}")
-    for intf in data['interfaces']:
-        print(f"    {intf['name']:<18}{intf['state']:<8}{intf['mtu']:<6}{intf['mac']:<20}{intf['ip']:<18}{intf['learning']}")
-    print(f"\n  MAC Table:")
+def print_bridge_summary(bridges, bridge_filter=None):
+    for name, data in sorted(bridges.items()):
+        if bridge_filter and name != bridge_filter:
+            continue
+        print(f"\nBridge domain: {name}")
+        print(f"  Type: {data['type']}     Interfaces: {len(data['interfaces'])}")
+        print(f"    {'Interface':<18}{'State':<8}{'MTU':<6}{'MAC Address':<20}{'IP Address':<18}{'MAC learning'}")
+        for intf in data['interfaces']:
+            print(f"    {intf['name']:<18}{intf['state']:<8}{intf['mtu']:<6}{intf['mac']:<20}{intf['ip']:<18}{intf['learning']}")
+
+
+def print_bridge_detail(bridges, bridge_filter):
+    if bridge_filter not in bridges:
+        print(f"Bridge '{bridge_filter}' not found.")
+        return
+    data = bridges[bridge_filter]
+    print_bridge_summary(bridges, bridge_filter)
+    print("\n  MAC Table:")
     print(f"    {'MAC Address':<20}{'Interface':<20}")
-    for mac_entry in data['mac_table']:
-        print(f"    {mac_entry['mac']:<20}{mac_entry['interface']:<20}")
+    for entry in data['mac_table']:
+        print(f"    {entry['mac']:<20}{entry['interface']:<20}")
 
-# Step 9: Default output
-if args.bridge:
-    if args.bridge in bridges:
-        show_bridge(args.bridge, bridges[args.bridge])
+
+def print_json(data):
+    print(json.dumps(data, indent=2))
+
+
+def print_usage():
+    print("Usage:")
+    print("  netview interface [<interface>] [detail|display json]")
+    print("  netview bridge [<bridge>] [detail|display json]")
+
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+
+    if not args:
+        print_usage()
+        sys.exit(0)
+
+    if args[0] == "interface":
+        interfaces = get_linux_interfaces()
+        if len(args) == 1:
+            print_interface_summary(interfaces)
+        elif len(args) == 2 and args[1] not in ("display", "json", "detail"):
+            print_interface_summary(interfaces, args[1])
+        elif len(args) == 3 and args[2] == "detail":
+            print_interface_detail(interfaces, args[1])
+        elif args[-2:] == ["display", "json"]:
+            if len(args) == 3 and args[1] == "display":
+                print_json(interfaces)
+            elif len(args) == 4:
+                iface_name = args[1]
+                if iface_name in interfaces:
+                    print_json({iface_name: interfaces[iface_name]})
+                else:
+                    print_json({"error": f"Interface '{iface_name}' not found"})
+        else:
+            print("Invalid interface command.")
+
+    elif args[0] == "bridge":
+        bridges = get_linux_bridges()
+        if len(args) == 1:
+            print_bridge_summary(bridges)
+        elif len(args) == 2 and args[1] not in ("display", "json", "detail"):
+            print_bridge_summary(bridges, args[1])
+        elif len(args) == 3 and args[2] == "detail":
+            print_bridge_detail(bridges, args[1])
+        elif args[-2:] == ["display", "json"]:
+            if len(args) == 3 and args[1] == "display":
+                print_json(bridges)
+            elif len(args) == 4:
+                bridge_name = args[1]
+                if bridge_name in bridges:
+                    print_json({bridge_name: bridges[bridge_name]})
+                else:
+                    print_json({"error": f"Bridge '{bridge_name}' not found"})
+        else:
+            print("Invalid bridge command.")
+
     else:
-        print(f"Bridge '{args.bridge}' not found.")
-else:
-    for br in sorted(bridges.keys()):
-        show_bridge(br, bridges[br])
-
+        print_usage()
